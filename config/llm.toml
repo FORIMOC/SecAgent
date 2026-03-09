@@ -1,0 +1,29 @@
+# SecAgent LLM config
+# Priority: env var > this file
+# You can point to another file via: export SECAGENT_LLM_CONFIG=/abs/path/to/llm.toml
+
+[llm]
+provider = "deepseek"
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
+timeout = 150
+temperature = 0.1
+max_tokens = 4096
+
+# Read key from an environment variable (do NOT put plaintext key here)
+api_key_env = "DEEPSEEK_API_KEY"
+
+# Optional provider-specific key mapping (also env-var based)
+[llm.provider_key_env]
+deepseek = "DEEPSEEK_API_KEY"
+openai = "OPENAI_API_KEY"
+qwen = "QWEN_API_KEY"
+claude = "CLAUDE_API_KEY"
+gemini = "GEMINI_API_KEY"
+
+[agent]
+llm_first_token_timeout = 30
+llm_stream_timeout = 60
+agent_timeout_seconds = 1800
+sub_agent_timeout_seconds = 600
+tool_timeout_seconds = 60
