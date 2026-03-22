@@ -33,15 +33,27 @@ class SandboxConfig:
     no_new_privileges: bool = True  # 禁止提权
 
     def __post_init__(self):
+        def _parse_bool(value: Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        # 注意：settings 中同名类属性会遮蔽 __getattr__，这里优先使用环境变量。
         if self.image is None:
-            self.image = settings.SANDBOX_IMAGE
+            self.image = os.getenv("SANDBOX_IMAGE") or getattr(settings, "SANDBOX_IMAGE", "python:3.11-slim")
         if self.cap_drop is None:
-            cap_drop_str = getattr(settings, 'SANDBOX_CAP_DROP', 'ALL')
+            cap_drop_str = os.getenv("SANDBOX_CAP_DROP")
+            if cap_drop_str is None:
+                cap_drop_str = getattr(settings, 'SANDBOX_CAP_DROP', 'ALL')
             if cap_drop_str.upper() == 'NONE':
                 self.cap_drop = []
             else:
                 self.cap_drop = [c.strip() for c in cap_drop_str.split(',') if c.strip()]
-        self.no_new_privileges = getattr(settings, 'SANDBOX_NO_NEW_PRIVILEGES', True)
+        env_nnp = os.getenv("SANDBOX_NO_NEW_PRIVILEGES")
+        default_nnp = getattr(settings, 'SANDBOX_NO_NEW_PRIVILEGES', True)
+        self.no_new_privileges = _parse_bool(env_nnp, bool(default_nnp))
 
 
 class SandboxManager:
@@ -421,6 +433,19 @@ class SandboxManager:
                         "body": body[:5000],
                         "error": None,
                     }
+
+            stderr_text = str(result.get("stderr") or "")
+            error_text = str(result.get("error") or "")
+            # python:3.11-slim 等镜像默认没有 curl，自动回退到 Python urllib 实现
+            if "curl: not found" in stderr_text or "curl: not found" in error_text:
+                logger.warning("curl not found in sandbox image, fallback to python urllib")
+                return await self._execute_http_request_via_python(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    data=data,
+                    timeout=timeout,
+                )
             
             return {
                 "success": False,
@@ -431,6 +456,77 @@ class SandboxManager:
             
         finally:
             self.config.network_mode = original_network
+
+    async def _execute_http_request_via_python(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[str] = None,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        payload = {
+            "method": str(method or "GET").upper(),
+            "url": str(url or ""),
+            "headers": headers or {},
+            "data": data,
+        }
+        payload_literal = json.dumps(json.dumps(payload, ensure_ascii=False), ensure_ascii=False)
+        py_code = f"""
+import json, urllib.request, urllib.error
+cfg = json.loads({payload_literal})
+body_data = cfg.get("data")
+if body_data is not None:
+    body_data = body_data.encode("utf-8")
+req = urllib.request.Request(
+    cfg.get("url", ""),
+    data=body_data,
+    method=cfg.get("method", "GET"),
+    headers=cfg.get("headers", {{}}),
+)
+out = {{"success": True, "status_code": 0, "body": "", "error": None}}
+try:
+    with urllib.request.urlopen(req, timeout={max(1, int(timeout))}) as resp:
+        out["status_code"] = int(getattr(resp, "status", resp.getcode()) or 0)
+        out["body"] = resp.read().decode("utf-8", errors="ignore")
+except urllib.error.HTTPError as e:
+    out["success"] = False
+    out["status_code"] = int(getattr(e, "code", 0) or 0)
+    try:
+        out["body"] = e.read().decode("utf-8", errors="ignore")
+    except Exception:
+        out["body"] = ""
+    out["error"] = f"HTTPError: {{e}}"
+except Exception as e:
+    out["success"] = False
+    out["error"] = str(e)
+print(json.dumps(out, ensure_ascii=False))
+"""
+        result = await self.execute_python(py_code, timeout=timeout)
+        if not result.get("success"):
+            return {
+                "success": False,
+                "status_code": 0,
+                "body": "",
+                "error": result.get("error") or result.get("stderr") or "python http fallback failed",
+            }
+        stdout = str(result.get("stdout") or "").strip()
+        line = stdout.splitlines()[-1] if stdout else ""
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            return {
+                "success": False,
+                "status_code": 0,
+                "body": "",
+                "error": f"python http fallback parse failed: {line[:200]}",
+            }
+        return {
+            "success": bool(parsed.get("success")),
+            "status_code": int(parsed.get("status_code") or 0),
+            "body": str(parsed.get("body") or "")[:5000],
+            "error": parsed.get("error"),
+        }
     
     async def verify_vulnerability(
         self,
@@ -591,9 +687,10 @@ class SandboxTool(AgentTool):
         await self.sandbox_manager.initialize()
         
         if not self.sandbox_manager.is_available:
+            diagnosis = self.sandbox_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用（Docker 未安装或未运行）",
+                error=f"沙箱环境不可用（Docker Unavailable）: {diagnosis}",
             )
         
         # 安全检查：验证命令是否允许
@@ -700,9 +797,10 @@ class SandboxHttpTool(AgentTool):
             logger.warning(f"Sandbox init failed during execution: {e}")
         
         if not self.sandbox_manager.is_available:
+            diagnosis = self.sandbox_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用 (Docker Unavailable)",
+                error=f"沙箱环境不可用 (Docker Unavailable): {diagnosis}",
             )
         
         result = await self.sandbox_manager.execute_http_request(
@@ -805,9 +903,10 @@ class VulnerabilityVerifyTool(AgentTool):
             logger.warning(f"Sandbox init failed during execution: {e}")
         
         if not self.sandbox_manager.is_available:
+            diagnosis = self.sandbox_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用 (Docker Unavailable)",
+                error=f"沙箱环境不可用 (Docker Unavailable): {diagnosis}",
             )
         
         result = await self.sandbox_manager.verify_vulnerability(
@@ -833,9 +932,11 @@ class VulnerabilityVerifyTool(AgentTool):
         if result.get("response_status"):
             output_parts.append(f"\nHTTP 状态码: {result['response_status']}")
         
+        tool_success = not bool(result.get("error"))
         return ToolResult(
-            success=True,
+            success=tool_success,
             data="\n".join(output_parts),
+            error=result.get("error"),
             metadata={
                 "vulnerability_type": vulnerability_type,
                 "is_vulnerable": result["is_vulnerable"],
@@ -863,7 +964,12 @@ class PhpTestTool(AgentTool):
 
     def __init__(self, sandbox_manager: Optional[SandboxManager] = None, project_root: str = "."):
         super().__init__()
-        self.sandbox_manager = sandbox_manager or SandboxManager()
+        if sandbox_manager is not None:
+            self.sandbox_manager = sandbox_manager
+        else:
+            # PHP 测试优先使用 PHP 镜像，避免默认 python 镜像里缺少 php 二进制。
+            php_image = os.getenv("SANDBOX_PHP_IMAGE") or "php:8.2-cli"
+            self.sandbox_manager = SandboxManager(SandboxConfig(image=php_image))
         self.project_root = project_root
 
     @property
@@ -912,9 +1018,10 @@ class PhpTestTool(AgentTool):
             logger.warning(f"Sandbox init failed: {e}")
 
         if not self.sandbox_manager.is_available:
+            diagnosis = self.sandbox_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用 (Docker Unavailable)",
+                error=f"沙箱环境不可用 (Docker Unavailable): {diagnosis}",
             )
 
         # 构建 PHP 代码
@@ -937,7 +1044,8 @@ class PhpTestTool(AgentTool):
             )
 
         # 构建模拟 $_GET 和 $_POST 的包装代码
-        wrapper_parts = ["<?php"]
+        # 注意：php -r 不接受 <?php / ?> 标签，这里只拼接纯 PHP 语句。
+        wrapper_parts = []
 
         # 模拟 $_GET
         if get_params:
@@ -962,7 +1070,6 @@ class PhpTestTool(AgentTool):
             clean_code = clean_code[:-2].strip()
 
         wrapper_parts.append(clean_code)
-        wrapper_parts.append("?>")
 
         full_php_code = "\n".join(wrapper_parts)
 
@@ -1025,9 +1132,12 @@ class PhpTestTool(AgentTool):
         else:
             output_parts.append(f"\n🟡 未能确认漏洞执行（可能需要检查输出）")
 
+        tool_success = bool(result.get("success")) and int(result.get("exit_code", -1)) == 0
+        tool_error = result.get("error") or (result.get("stderr") if not tool_success else None)
         return ToolResult(
-            success=True,
+            success=tool_success,
             data="\n".join(output_parts),
+            error=tool_error,
             metadata={
                 "exit_code": result["exit_code"],
                 "is_vulnerable": is_vulnerable,
@@ -1056,6 +1166,12 @@ class CommandInjectionTestTool(AgentTool):
     def __init__(self, sandbox_manager: Optional[SandboxManager] = None, project_root: str = "."):
         super().__init__()
         self.sandbox_manager = sandbox_manager or SandboxManager()
+        # PHP 语言测试时使用 PHP 镜像；其他语言仍使用默认沙箱镜像。
+        if sandbox_manager is not None:
+            self.php_sandbox_manager = sandbox_manager
+        else:
+            php_image = os.getenv("SANDBOX_PHP_IMAGE") or "php:8.2-cli"
+            self.php_sandbox_manager = SandboxManager(SandboxConfig(image=php_image))
         self.project_root = project_root
 
     @property
@@ -1094,15 +1210,17 @@ class CommandInjectionTestTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行命令注入测试"""
+        active_manager = self.php_sandbox_manager if language.lower() == "php" else self.sandbox_manager
         try:
-            await self.sandbox_manager.initialize()
+            await active_manager.initialize()
         except Exception as e:
             logger.warning(f"Sandbox init failed: {e}")
 
-        if not self.sandbox_manager.is_available:
+        if not active_manager.is_available:
+            diagnosis = active_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用 (Docker Unavailable)",
+                error=f"沙箱环境不可用 (Docker Unavailable): {diagnosis}",
             )
 
         import os
@@ -1126,9 +1244,9 @@ class CommandInjectionTestTool(AgentTool):
 
         # 根据语言构建测试
         if language.lower() == "php":
-            result = await self._test_php_injection(code_content, param_name, test_command)
+            result = await self._test_php_injection(code_content, param_name, test_command, manager=active_manager)
         elif language.lower() == "python":
-            result = await self._test_python_injection(code_content, param_name, test_command)
+            result = await self._test_python_injection(code_content, param_name, test_command, manager=active_manager)
         else:
             return ToolResult(
                 success=False,
@@ -1177,9 +1295,12 @@ class CommandInjectionTestTool(AgentTool):
             if result.get("stderr"):
                 output_parts.append(f"可能原因: 执行错误或参数未正确传递")
 
+        tool_success = bool(result.get("success")) and int(result.get("exit_code", -1)) == 0
+        tool_error = result.get("error") or (result.get("stderr") if not tool_success else None)
         return ToolResult(
-            success=True,
+            success=tool_success,
             data="\n".join(output_parts),
+            error=tool_error,
             metadata={
                 "is_vulnerable": is_vulnerable,
                 "evidence": evidence,
@@ -1188,10 +1309,16 @@ class CommandInjectionTestTool(AgentTool):
             }
         )
 
-    async def _test_php_injection(self, code: str, param_name: str, test_command: str) -> Dict[str, Any]:
+    async def _test_php_injection(
+        self,
+        code: str,
+        param_name: str,
+        test_command: str,
+        manager: Optional[SandboxManager] = None,
+    ) -> Dict[str, Any]:
         """测试 PHP 命令注入"""
-        # 构建模拟环境
-        wrapper = f"""<?php
+        # 构建模拟环境（php -r 不接受 <?php / ?> 标签）
+        wrapper = f"""
 $_GET['{param_name}'] = '{test_command}';
 $_POST['{param_name}'] = '{test_command}';
 $_REQUEST['{param_name}'] = '{test_command}';
@@ -1205,15 +1332,22 @@ $_REQUEST['{param_name}'] = '{test_command}';
         if clean_code.endswith("?>"):
             clean_code = clean_code[:-2]
 
-        full_code = wrapper + clean_code + "\n?>"
+        full_code = wrapper + clean_code
 
         # 转义并执行
         escaped_code = full_code.replace("'", "'\"'\"'")
         command = f"php -r '{escaped_code}'"
 
-        return await self.sandbox_manager.execute_command(command, timeout=30)
+        runner = manager or self.sandbox_manager
+        return await runner.execute_command(command, timeout=30)
 
-    async def _test_python_injection(self, code: str, param_name: str, test_command: str) -> Dict[str, Any]:
+    async def _test_python_injection(
+        self,
+        code: str,
+        param_name: str,
+        test_command: str,
+        manager: Optional[SandboxManager] = None,
+    ) -> Dict[str, Any]:
         """测试 Python 命令注入"""
         # 模拟 request.args.get
         wrapper = f"""
@@ -1237,4 +1371,5 @@ sys.argv = ['script.py', '{test_command}']
         escaped_code = full_code.replace("'", "'\"'\"'")
         command = f"python3 -c '{escaped_code}'"
 
-        return await self.sandbox_manager.execute_command(command, timeout=30)
+        runner = manager or self.sandbox_manager
+        return await runner.execute_command(command, timeout=30)

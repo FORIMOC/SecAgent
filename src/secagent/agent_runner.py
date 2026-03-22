@@ -177,10 +177,7 @@ def _build_llm_service() -> Any:
     return llm
 
 
-async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> dict[str, Any]:
-    llm_service = _build_llm_service()
-
-    target_files = _pick_target_files(repo_path, constraint)
+def _build_tools(repo_path: str, llm_service: Any, target_files: list[str] | None = None) -> dict[str, Any]:
     tools = {
         # Core file tools (hard requirement)
         "list_files": ListFilesTool(project_root=repo_path, target_files=target_files or None),
@@ -188,7 +185,7 @@ async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> d
         "search_code": FileSearchTool(project_root=repo_path, target_files=target_files or None),
         # Non-SAST analysis helpers
         "pattern_match": PatternMatchTool(project_root=repo_path),
-        "code_analysis": CodeAnalysisTool(llm_service=llm_service),
+        "code_analysis": CodeAnalysisTool(llm_service=llm_service, project_root=repo_path),
         "dataflow_analysis": DataFlowAnalysisTool(llm_service=llm_service),
         "vulnerability_validation": VulnerabilityValidationTool(llm_service=llm_service),
         "smart_scan": SmartScanTool(project_root=repo_path),
@@ -203,6 +200,75 @@ async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> d
     _safe_add_tool(tools, "verify_vulnerability", lambda: VulnerabilityVerifyTool())
     _safe_add_tool(tools, "php_test", lambda: PhpTestTool(project_root=repo_path))
     _safe_add_tool(tools, "test_command_injection", lambda: CommandInjectionTestTool(project_root=repo_path))
+    return tools
+
+
+def _extract_target_files_from_findings(findings: list[dict[str, Any]], max_files: int = 80) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(path: str) -> None:
+        p = str(path or "").strip()
+        if not p:
+            return
+        if p.startswith("./"):
+            p = p[2:]
+        if p in seen:
+            return
+        seen.add(p)
+        out.append(p)
+
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        _add(str(f.get("file_path") or f.get("file") or ""))
+        nodes = f.get("source_to_sink_path")
+        if isinstance(nodes, list):
+            for n in nodes:
+                if not isinstance(n, dict):
+                    continue
+                _add(str(n.get("file_path") or n.get("File") or ""))
+                if len(out) >= max_files:
+                    return out
+        if len(out) >= max_files:
+            return out
+    return out
+
+
+async def run_verifier_only(
+    repo_path: str,
+    findings: list[dict[str, Any]],
+    cve_id: str = "verify-only",
+    verification_level: str = "standard",
+) -> dict[str, Any]:
+    llm_service = _build_llm_service()
+    target_files = _extract_target_files_from_findings(findings)
+    tools = _build_tools(repo_path, llm_service, target_files=target_files)
+
+    verification = VerificationAgent(llm_service=llm_service, tools=tools)
+    if hasattr(verification, "set_log_context"):
+        verification.set_log_context(cve_id)
+
+    result = await verification.run(
+        {
+            "previous_results": {"findings": findings},
+            "config": {
+                "verification_level": verification_level,
+                "target_files": target_files,
+            },
+            "project_root": repo_path,
+            "task": f"Verify existing findings only ({cve_id})",
+            "task_context": "Validate provided source-to-sink evidence path",
+        }
+    )
+    return result.to_dict()
+
+
+async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> dict[str, Any]:
+    llm_service = _build_llm_service()
+
+    target_files = _pick_target_files(repo_path, constraint)
+    tools = _build_tools(repo_path, llm_service, target_files=target_files)
 
     recon = ReconAgent(llm_service=llm_service, tools=tools)
     analysis = AnalysisAgent(llm_service=llm_service, tools=tools)
@@ -227,8 +293,15 @@ async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> d
         "title": constraint.title,
         "description": constraint.description,
         "patch_files": constraint.target_files[:30],
-        "patch_old_lines": constraint.patch_old_lines[:20],
         "patch_focus_variables": constraint.patch_focus_variables[:20],
+        # Avoid injecting full raw patch old lines into prompt context.
+        # Keep only compact semantic hints derived from patch diffs.
+        "patch_semantic_snippet_count": len(constraint.patch_focus_semantic_snippets or []),
+        "patch_semantic_reasons": [
+            str(x.get("reason") or "semantic_change")
+            for x in (constraint.patch_focus_semantic_snippets or [])[:8]
+            if isinstance(x, dict)
+        ],
         "advisory_summary": constraint.advisory_summary[:2000] if constraint.advisory_summary else "",
         "advisory_refs": constraint.advisory_refs[:8],
         "effective_target_files": target_files[:30],
@@ -249,6 +322,7 @@ async def run_cve_directed_audit(repo_path: str, constraint: CVEConstraint) -> d
         "exclude_patterns": [".git", "node_modules", "dist", "build", "__pycache__"],
         "target_vulnerabilities": [constraint.vulnerability_hint],
         "patch_focus_variables": constraint.patch_focus_variables[:20],
+        "patch_focus_semantic_snippets": (constraint.patch_focus_semantic_snippets or [])[:8],
         "cve_advisory_summary": constraint.advisory_summary[:2000] if constraint.advisory_summary else "",
         "cve_advisory_refs": constraint.advisory_refs[:8],
         "verification_level": "standard",

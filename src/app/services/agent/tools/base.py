@@ -86,8 +86,73 @@ class AgentTool(ABC):
         start_time = time.time()
         
         try:
-            logger.debug(f"Tool '{self.name}' executing with args: {kwargs}")
-            result = await self._execute(**kwargs)
+            validated_kwargs = kwargs
+            if self.args_schema:
+                try:
+                    schema_cls = self.args_schema
+                    if hasattr(schema_cls, "model_validate"):  # Pydantic v2
+                        parsed = schema_cls.model_validate(kwargs)
+                        parsed_data = parsed.model_dump()
+                    else:  # Pydantic v1
+                        parsed = schema_cls.parse_obj(kwargs)
+                        parsed_data = parsed.dict()
+
+                    # 保留 schema 未定义的扩展参数，同时使用校验后的值覆盖同名字段
+                    validated_kwargs = dict(kwargs)
+                    validated_kwargs.update(parsed_data)
+                except Exception as e:
+                    required_fields = []
+                    try:
+                        if hasattr(schema_cls, "model_json_schema"):  # Pydantic v2
+                            required_fields = schema_cls.model_json_schema().get("required", [])
+                        else:  # Pydantic v1
+                            required_fields = schema_cls.schema().get("required", [])
+                    except Exception:
+                        required_fields = []
+
+                    required_hint = (
+                        f"，必填参数: {', '.join(required_fields)}"
+                        if required_fields
+                        else ""
+                    )
+                    details = ""
+                    if hasattr(e, "errors"):
+                        try:
+                            normalized_errors = []
+                            for item in e.errors()[:3]:
+                                loc = ".".join(str(x) for x in item.get("loc", [])) or "参数"
+                                msg = item.get("msg", "格式错误")
+                                normalized_errors.append(f"{loc}: {msg}")
+                            details = "; ".join(normalized_errors)
+                        except Exception:
+                            details = ""
+                    if not details:
+                        details = str(e).splitlines()[0]
+
+                    current_keys: list[str] = []
+                    if isinstance(kwargs, dict):
+                        current_keys = [str(k) for k in kwargs.keys()]
+                    extra_hints: list[str] = []
+                    if isinstance(kwargs, dict) and isinstance(kwargs.get("items"), list):
+                        extra_hints.append("检测到 items 包装，请将 Action Input 改为单个 JSON 对象，不要使用 {'items': [...]}。")
+                    if isinstance(kwargs, dict) and "raw_input" in kwargs:
+                        extra_hints.append("检测到 raw_input，说明上游 Action Input JSON 解析失败，请输出严格 JSON。")
+                    if required_fields:
+                        extra_hints.append(f"建议至少包含必填字段: {', '.join(required_fields)}")
+                    if current_keys:
+                        extra_hints.append(f"当前顶层键: {', '.join(current_keys[:12])}")
+                    hint_text = f" 纠错建议: {' | '.join(extra_hints)}" if extra_hints else ""
+
+                    error_msg = f"参数校验失败{required_hint}。详细: {details}.{hint_text}"
+                    logger.warning(f"Tool '{self.name}' {error_msg}")
+                    return ToolResult(
+                        success=False,
+                        data=f"工具参数错误: {error_msg}",
+                        error=error_msg,
+                    )
+
+            logger.debug(f"Tool '{self.name}' executing with args: {validated_kwargs}")
+            result = await self._execute(**validated_kwargs)
             
         except Exception as e:
             logger.error(f"Tool '{self.name}' error: {e}", exc_info=True)
@@ -155,4 +220,3 @@ class AgentTool(ABC):
             "total_duration_ms": self._total_duration_ms,
             "avg_duration_ms": self._total_duration_ms // max(1, self._call_count),
         }
-

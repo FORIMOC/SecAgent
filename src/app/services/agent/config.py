@@ -86,8 +86,8 @@ class AgentConfig(BaseSettings):
         description="Timeout in seconds for orchestrator (30 minutes)"
     )
     sub_agent_timeout_seconds: int = Field(
-        default=600,
-        description="Timeout in seconds for sub-agents (10 minutes)"
+        default=1800,
+        description="Timeout in seconds for sub-agents (30 minutes)"
     )
 
     # ============ Tool Settings ============

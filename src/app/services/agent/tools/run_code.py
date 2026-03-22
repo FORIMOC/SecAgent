@@ -25,10 +25,65 @@ from .sandbox_tool import SandboxManager, SandboxConfig
 logger = logging.getLogger(__name__)
 
 
+LANGUAGE_ALIASES: Dict[str, str] = {
+    "python": "python",
+    "py": "python",
+    "php": "php",
+    "javascript": "javascript",
+    "js": "javascript",
+    "node": "javascript",
+    "go": "go",
+    "golang": "go",
+    "java": "java",
+    "ruby": "ruby",
+    "bash": "bash",
+    "sh": "bash",
+}
+
+DEFAULT_RUNTIME_VERSIONS: Dict[str, str] = {
+    "python": "3.11",
+    "php": "8.2",
+    "javascript": "20",
+    "go": "1.22",
+    "java": "17",
+}
+
+RUNTIME_IMAGE_TEMPLATES: Dict[str, str] = {
+    "python": "python:{version}-slim",
+    "php": "php:{version}-cli",
+    "javascript": "node:{version}-slim",
+    "go": "golang:{version}-bookworm",
+    "java": "eclipse-temurin:{version}-jdk",
+}
+
+
+def _normalize_language_name(language: str) -> str:
+    lang = str(language or "").strip().lower()
+    return LANGUAGE_ALIASES.get(lang, lang)
+
+
+def _sanitize_runtime_version(version: Optional[str]) -> Optional[str]:
+    raw = str(version or "").strip()
+    if not raw:
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if any(ch not in allowed for ch in raw):
+        return None
+    return raw[:32]
+
+
 class RunCodeInput(BaseModel):
     """代码执行输入"""
     code: str = Field(..., description="要执行的代码")
     language: str = Field(default="python", description="编程语言: python, php, javascript, ruby, go, java, bash")
+    runtime_version: Optional[str] = Field(
+        default=None,
+        description="可选运行时版本（如 python=3.12, javascript=20, go=1.22, java=17, php=8.2）",
+    )
+    docker_image: Optional[str] = Field(
+        default=None,
+        description="可选完整 Docker 镜像名，提供后将覆盖 language/runtime_version 自动选镜像",
+    )
     timeout: int = Field(default=60, description="超时时间（秒），复杂测试可设置更长")
     description: str = Field(default="", description="简短描述这段代码的目的（用于日志）")
 
@@ -50,12 +105,10 @@ class RunCodeTool(AgentTool):
 
     def __init__(self, sandbox_manager: Optional[SandboxManager] = None, project_root: str = "."):
         super().__init__()
-        # 使用更宽松的沙箱配置
-        config = SandboxConfig(
-            timeout=120,
-            memory_limit="1g",  # 更大内存
-        )
-        self.sandbox_manager = sandbox_manager or SandboxManager(config)
+        self._fixed_sandbox_manager = sandbox_manager
+        self._sandbox_manager_cache: Dict[str, SandboxManager] = {}
+        self._base_sandbox_timeout = 120
+        self._base_sandbox_memory_limit = "1g"
         self.project_root = project_root
 
     @property
@@ -75,6 +128,8 @@ class RunCodeTool(AgentTool):
 输入：
 - code: 你编写的测试代码（完整可执行）
 - language: python, php, javascript, ruby, go, java, bash
+- runtime_version: 可选运行时版本（5种语言默认: python=3.11, php=8.2, javascript=20, go=1.22, java=17）
+- docker_image: 可选完整镜像（例如 `node:20-slim`），会覆盖自动镜像选择
 - timeout: 超时秒数（默认60，复杂测试可设更长）
 - description: 简短描述代码目的
 
@@ -132,27 +187,43 @@ for payload in payloads:
         self,
         code: str,
         language: str = "python",
+        runtime_version: Optional[str] = None,
+        docker_image: Optional[str] = None,
         timeout: int = 60,
         description: str = "",
         **kwargs
     ) -> ToolResult:
         """执行用户编写的代码"""
+        language_requested = str(language or "").strip().lower()
+        language = _normalize_language_name(language)
+
+        sandbox_image, image_source = self._resolve_runtime_image(
+            language=language,
+            runtime_version=runtime_version,
+            docker_image=docker_image,
+        )
+        sandbox_manager = self._get_sandbox_manager(sandbox_image)
 
         # 初始化沙箱
         try:
-            await self.sandbox_manager.initialize()
+            await sandbox_manager.initialize()
         except Exception as e:
             logger.warning(f"Sandbox init failed: {e}")
 
-        if not self.sandbox_manager.is_available:
+        if not sandbox_manager.is_available:
+            diagnosis = sandbox_manager.get_diagnosis()
             return ToolResult(
                 success=False,
-                error="沙箱环境不可用 (Docker 未运行)",
-                data="请确保 Docker 已启动。如果无法使用沙箱，你可以通过静态分析代码来验证漏洞。"
+                error=f"沙箱环境不可用 (Docker Unavailable): {diagnosis}",
+                data=(
+                    "请确保当前 Python 进程可访问 Docker daemon。"
+                    f"\n诊断: {diagnosis}\n"
+                    f"镜像: {sandbox_image}\n"
+                    "如果无法使用沙箱，你可以通过静态分析代码来验证漏洞。"
+                ),
             )
 
         # 构建执行命令
-        language = language.lower().strip()
         command = self._build_command(code, language)
 
         if command is None:
@@ -163,9 +234,11 @@ for payload in payloads:
             )
 
         # 在沙箱中执行
-        result = await self.sandbox_manager.execute_command(
+        runtime_env = self._build_runtime_env(language)
+        result = await sandbox_manager.execute_command(
             command=command,
             timeout=timeout,
+            env=runtime_env,
         )
 
         # 格式化输出
@@ -173,6 +246,7 @@ for payload in payloads:
         if description:
             output_parts.append(f"目的: {description}")
         output_parts.append(f"语言: {language}")
+        output_parts.append(f"镜像: {sandbox_image}")
         output_parts.append(f"退出码: {result['exit_code']}")
 
         if result.get("stdout"):
@@ -200,11 +274,87 @@ for payload in payloads:
             error=result.get("error"),
             metadata={
                 "language": language,
+                "language_requested": language_requested,
+                "runtime_version": _sanitize_runtime_version(runtime_version),
+                "sandbox_image": sandbox_image,
+                "image_source": image_source,
+                "runtime_env": runtime_env,
                 "exit_code": result.get("exit_code", -1),
                 "stdout_length": len(result.get("stdout", "")),
                 "stderr_length": len(result.get("stderr", "")),
             }
         )
+
+    def _build_runtime_env(self, language: str) -> Dict[str, str]:
+        lang = _normalize_language_name(language)
+        env: Dict[str, str] = {
+            "HOME": "/home/sandbox",
+            "XDG_CACHE_HOME": "/tmp/.cache",
+        }
+        if lang == "go":
+            env.update(
+                {
+                    # /tmp 在当前沙箱里可能带 noexec，go run 产物无法执行。
+                    # 使用 /workspace 可执行挂载目录作为缓存路径。
+                    "GOCACHE": "/workspace/.cache/go-build",
+                    "GOPATH": "/workspace/.cache/go",
+                    "GOENV": "/workspace/.cache/go/env",
+                    "TMPDIR": "/workspace/.cache/tmp",
+                    "GOTMPDIR": "/workspace/.cache/tmp",
+                }
+            )
+        return env
+
+    def _default_runtime_version(self, language: str) -> str:
+        lang = _normalize_language_name(language)
+        env_version = _sanitize_runtime_version(os.getenv(f"SANDBOX_VERSION_{lang.upper()}"))
+        if env_version:
+            return env_version
+        return DEFAULT_RUNTIME_VERSIONS.get(lang, "")
+
+    def _resolve_runtime_image(
+        self,
+        language: str,
+        runtime_version: Optional[str] = None,
+        docker_image: Optional[str] = None,
+    ) -> tuple[str, str]:
+        custom_image = str(docker_image or "").strip()
+        if custom_image:
+            return custom_image, "custom_image"
+
+        lang = _normalize_language_name(language)
+        env_image = str(os.getenv(f"SANDBOX_IMAGE_{lang.upper()}") or "").strip()
+        if env_image:
+            return env_image, "env_lang_image"
+
+        template = RUNTIME_IMAGE_TEMPLATES.get(lang)
+        if template:
+            version = _sanitize_runtime_version(runtime_version) or self._default_runtime_version(lang)
+            if version:
+                return template.format(version=version), "language_version_default"
+
+        fallback = str(os.getenv("SANDBOX_IMAGE") or "").strip()
+        if fallback:
+            return fallback, "env_default_image"
+        return "python:3.11-slim", "hardcoded_default_image"
+
+    def _get_sandbox_manager(self, image: str) -> SandboxManager:
+        if self._fixed_sandbox_manager is not None:
+            return self._fixed_sandbox_manager
+
+        key = str(image or "").strip() or "python:3.11-slim"
+        mgr = self._sandbox_manager_cache.get(key)
+        if mgr is not None:
+            return mgr
+
+        cfg = SandboxConfig(
+            image=key,
+            timeout=self._base_sandbox_timeout,
+            memory_limit=self._base_sandbox_memory_limit,
+        )
+        mgr = SandboxManager(cfg)
+        self._sandbox_manager_cache[key] = mgr
+        return mgr
 
     def _build_command(self, code: str, language: str) -> Optional[str]:
         """根据语言构建执行命令"""
@@ -244,7 +394,11 @@ for payload in payloads:
         elif language == "go":
             # Go 需要完整的 package main
             escaped = escape_for_shell(code).replace("\\", "\\\\")
-            return f"echo '{escaped}' > /tmp/main.go && go run /tmp/main.go"
+            return (
+                "mkdir -p /workspace/.cache/tmp /workspace/.cache/go /workspace/.cache/go-build "
+                f"&& echo '{escaped}' > /workspace/main.go "
+                "&& go run /workspace/main.go"
+            )
 
         elif language == "java":
             # Java 需要完整的 class

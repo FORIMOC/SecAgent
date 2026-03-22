@@ -11,7 +11,7 @@ class _Settings:
     LLM_FIRST_TOKEN_TIMEOUT = 30
     LLM_STREAM_TIMEOUT = 60
     AGENT_TIMEOUT_SECONDS = 1800
-    SUB_AGENT_TIMEOUT_SECONDS = 600
+    SUB_AGENT_TIMEOUT_SECONDS = 1800
     TOOL_TIMEOUT_SECONDS = 60
 
     # Sandbox defaults (non-SAST verification tools)

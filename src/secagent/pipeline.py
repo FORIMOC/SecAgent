@@ -604,7 +604,6 @@ def _run_one_with_clone(
 
 def run_pipeline(
     cve_input_file: str | Path,
-    repo_path: str | Path | None = None,
     workers: int = 4,
     workspace_root: str | Path | None = None,
     repo_cache_root: str | Path | None = None,
@@ -614,7 +613,6 @@ def run_pipeline(
     constraints = parse_cve_file(cve_input_file)
     return run_pipeline_from_constraints(
         constraints=constraints,
-        repo_path=repo_path,
         workers=workers,
         workspace_root=workspace_root,
         repo_cache_root=repo_cache_root,
@@ -625,7 +623,6 @@ def run_pipeline(
 
 def run_pipeline_from_constraints(
     constraints: list,
-    repo_path: str | Path | None = None,
     workers: int = 4,
     workspace_root: str | Path | None = None,
     repo_cache_root: str | Path | None = None,
@@ -658,59 +655,45 @@ def run_pipeline_from_constraints(
         except Exception:
             pass
 
-    # Compatibility mode: user provides one fixed local repository
-    if repo_path:
-        for constraint in constraints:
+    project_root = Path(__file__).resolve().parents[2]
+    cache_root = (
+        Path(repo_cache_root)
+        if repo_cache_root
+        else project_root / "data" / "repos"
+    )
+    ws_root = (
+        Path(workspace_root)
+        if workspace_root
+        else Path(tempfile.mkdtemp(prefix="secagent_workspace_"))
+    )
+    ws_root.mkdir(parents=True, exist_ok=True)
+
+    max_workers = max(1, int(workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _run_one_with_clone,
+                constraint,
+                ws_root,
+                cache_root,
+                keep_workspace,
+            ): constraint
+            for constraint in constraints
+        }
+        for future in as_completed(future_map):
+            constraint = future_map[future]
             try:
-                item = asyncio.run(_run_single(str(repo_path), constraint))
-                if item:
-                    findings.append(item)
-                else:
-                    failures.append(f"{constraint.cve_id}: no directed finding produced")
-                _emit_progress(constraint, item, None if item else failures[-1])
+                item, err = future.result()
             except Exception as exc:
-                failures.append(f"{constraint.cve_id}: analysis failed: {exc}")
-                _emit_progress(constraint, None, failures[-1])
-    else:
-        project_root = Path(__file__).resolve().parents[2]
-        cache_root = (
-            Path(repo_cache_root)
-            if repo_cache_root
-            else project_root / "data" / "repos"
-        )
-        ws_root = (
-            Path(workspace_root)
-            if workspace_root
-            else Path(tempfile.mkdtemp(prefix="secagent_workspace_"))
-        )
-        ws_root.mkdir(parents=True, exist_ok=True)
+                item, err = None, f"{constraint.cve_id}: worker crashed: {exc}"
+            if item:
+                findings.append(item)
+            if err:
+                failures.append(err)
+            _emit_progress(constraint, item, err)
 
-        max_workers = max(1, int(workers))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(
-                    _run_one_with_clone,
-                    constraint,
-                    ws_root,
-                    cache_root,
-                    keep_workspace,
-                ): constraint
-                for constraint in constraints
-            }
-            for future in as_completed(future_map):
-                constraint = future_map[future]
-                try:
-                    item, err = future.result()
-                except Exception as exc:
-                    item, err = None, f"{constraint.cve_id}: worker crashed: {exc}"
-                if item:
-                    findings.append(item)
-                if err:
-                    failures.append(err)
-                _emit_progress(constraint, item, err)
-
-        if not keep_workspace and workspace_root is None:
-            shutil.rmtree(ws_root, ignore_errors=True)
+    if not keep_workspace and workspace_root is None:
+        shutil.rmtree(ws_root, ignore_errors=True)
 
     summary = {
         "total_cves": len(constraints),
@@ -719,7 +702,7 @@ def run_pipeline_from_constraints(
         "failed": len(failures),
         "mode": "migrated_deepaudit_multi_agent_with_cve_constraints",
         "workers": max(1, int(workers)),
-        "clone_mode": repo_path is None,
+        "clone_mode": True,
         "failures": failures[:50],
     }
     return PipelineResult(findings=findings, summary=summary)

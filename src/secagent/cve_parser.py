@@ -48,6 +48,17 @@ _STOPWORDS = {
     "request", "sanitize", "vulnerability", "patch", "fix", "safe", "unsafe",
 }
 
+_FIX_HINTS = (
+    "sanitize", "escaped", "escape", "encode", "encoding", "validate", "validator",
+    "filter", "safe", "safer", "prepared", "parameter", "bind", "quote", "whitelist",
+    "realpath", "normalize", "canonical", "strict", "text(", "htmlspecialchars",
+    "escapehtml", "escapexml", "escapeshell", "replace(", "strip_tags",
+)
+_RISK_HINTS = (
+    "eval(", "exec(", "system(", "popen(", "query(", "raw", "innerhtml", "v-html",
+    "extractall(", "pickle.load(", "yaml.load(", "deserialize", "unserialize",
+)
+
 
 def _normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -201,6 +212,100 @@ def _extract_focus_variables(old_lines: list[str], new_lines: list[str]) -> list
     return out
 
 
+def _semantic_change_score(old_line: str, new_line: str) -> tuple[int, list[str]]:
+    old = _normalize_space(old_line)
+    new = _normalize_space(new_line)
+    if not old or not new or old == new:
+        return 0, []
+
+    old_low = old.lower()
+    new_low = new.lower()
+    reasons: list[str] = []
+    score = 0
+
+    for kw in _FIX_HINTS:
+        if kw in new_low and kw not in old_low:
+            score += 2
+            reasons.append(f"add_fix:{kw}")
+
+    for kw in _RISK_HINTS:
+        if kw in old_low and kw not in new_low:
+            score += 2
+            reasons.append(f"remove_risk:{kw}")
+
+    if ".html(" in old_low and ".text(" in new_low:
+        score += 3
+        reasons.append("html_to_text")
+    if "v-html" in old_low and "v-html" not in new_low:
+        score += 2
+        reasons.append("remove_v_html")
+
+    # Example: entry.task -> entry.task.replace(...)
+    if "replace(" in new_low and "replace(" not in old_low:
+        score += 1
+        reasons.append("new_replace_call")
+
+    if re.search(r"([$A-Za-z_][A-Za-z0-9_\.]*)", old) and re.search(r"\(", new):
+        score += 1
+        reasons.append("expression_hardened")
+
+    return score, reasons
+
+
+def _extract_focus_semantic_snippets(old_lines: list[str], new_lines: list[str]) -> list[dict[str, str]]:
+    ranked: list[tuple[int, dict[str, str]]] = []
+    limit = min(len(old_lines), len(new_lines))
+    for idx in range(limit):
+        old = _normalize_space(old_lines[idx])
+        new = _normalize_space(new_lines[idx])
+        if not old or not new or old == new:
+            continue
+        score, reasons = _semantic_change_score(old, new)
+        if score < 2:
+            continue
+        ranked.append(
+            (
+                score,
+                {
+                    "old": old[:240],
+                    "new": new[:240],
+                    "reason": ",".join(reasons[:4]) if reasons else "semantic_change",
+                    "score": str(score),
+                },
+            )
+        )
+
+    ranked.sort(key=lambda x: int(x[0]), reverse=True)
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _score, item in ranked:
+        key = (item["old"], item["new"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= 12:
+            break
+
+    # fallback: keep a few changed pairs even when no strong fix signal is detected
+    if not out:
+        for idx in range(min(len(old_lines), len(new_lines))):
+            old = _normalize_space(old_lines[idx])
+            new = _normalize_space(new_lines[idx])
+            if old and new and old != new:
+                out.append(
+                    {
+                        "old": old[:240],
+                        "new": new[:240],
+                        "reason": "changed_line_pair",
+                        "score": "1",
+                    }
+                )
+                if len(out) >= 6:
+                    break
+    return out
+
+
 def parse_cve_file(path: str | Path) -> list[CVEConstraint]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     constraints: list[CVEConstraint] = []
@@ -276,6 +381,12 @@ def parse_cve_file(path: str | Path) -> list[CVEConstraint]:
         if not new_lines and isinstance(info.get("patch_new_lines"), list):
             new_lines = [str(x) for x in info.get("patch_new_lines", []) if str(x).strip()]
         focus_vars = _extract_focus_variables(old_lines, new_lines)
+        focus_semantic_snippets = _extract_focus_semantic_snippets(old_lines, new_lines)
+        if not focus_semantic_snippets and isinstance(info.get("patch_focus_semantic_snippets"), list):
+            focus_semantic_snippets = [
+                x for x in info.get("patch_focus_semantic_snippets", [])
+                if isinstance(x, dict) and (x.get("old") or x.get("new"))
+            ]
 
         constraints.append(
             CVEConstraint(
@@ -289,6 +400,7 @@ def parse_cve_file(path: str | Path) -> list[CVEConstraint]:
                 patch_old_lines=old_lines,
                 patch_new_lines=new_lines,
                 patch_focus_variables=focus_vars,
+                patch_focus_semantic_snippets=focus_semantic_snippets,
                 advisory_summary=advisory_summary,
                 advisory_refs=advisory_refs,
                 vulnerability_hint=hint,

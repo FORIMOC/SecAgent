@@ -55,7 +55,7 @@ class AgentConfig:
     
     # 执行限制
     max_iterations: int = 20
-    timeout_seconds: int = 600
+    timeout_seconds: int = 1800
     
     # 工具配置
     tools: List[str] = field(default_factory=list)
@@ -308,6 +308,10 @@ class BaseAgent(ABC):
         self._insights: List[str] = []  # 收集的洞察
         self._work_completed: List[str] = []  # 完成的工作记录
         self._cve_id: str = ""
+        # 跨 Agent 共享的工具结果缓存（用于减少重复调用）
+        self._shared_tool_cache: Dict[str, Dict[str, Any]] = {}
+        self._shared_tool_cache_order: List[str] = []
+        self._shared_tool_cache_hits: int = 0
         
         # 🔥 是否已注册到注册表
         self._registered = False
@@ -387,7 +391,7 @@ class BaseAgent(ABC):
             'llm_first_token_timeout': getattr(settings, 'LLM_FIRST_TOKEN_TIMEOUT', 30),
             'llm_stream_timeout': getattr(settings, 'LLM_STREAM_TIMEOUT', 60),
             'agent_timeout': getattr(settings, 'AGENT_TIMEOUT_SECONDS', 1800),
-            'sub_agent_timeout': getattr(settings, 'SUB_AGENT_TIMEOUT_SECONDS', 600),
+            'sub_agent_timeout': getattr(settings, 'SUB_AGENT_TIMEOUT_SECONDS', 1800),
             'tool_timeout': getattr(settings, 'TOOL_TIMEOUT_SECONDS', 60),
         }
     
@@ -542,6 +546,15 @@ class BaseAgent(ABC):
             handoff: 任务交接对象
         """
         self._incoming_handoff = handoff
+        # 尝试从 handoff 注入可复用的工具结果缓存
+        try:
+            cache_blob = (handoff.context_data or {}).get("shared_tool_cache")
+            if cache_blob:
+                loaded = self.load_shared_tool_cache(cache_blob)
+                if loaded > 0:
+                    logger.info(f"[{self.name}] Loaded {loaded} shared tool cache entries from handoff")
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to load shared tool cache from handoff: {e}")
         logger.info(
             f"[{self.name}] Received handoff from {handoff.from_agent}: "
             f"{handoff.summary[:50]}..."
@@ -603,6 +616,142 @@ class BaseAgent(ABC):
             priority_areas=priority_areas or [],
             context_data=context_data or {},
         )
+
+    @staticmethod
+    def _tool_cache_key(tool_name: str, tool_input: Dict[str, Any]) -> str:
+        try:
+            payload = json.dumps(tool_input or {}, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            payload = str(tool_input)
+        return f"{tool_name}::{payload}"
+
+    def _canonicalize_tool_input_for_cache(
+        self,
+        tool: Any,
+        tool_input: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        归一化工具参数用于缓存键：
+        - 基于 args_schema 进行类型归一化与默认值补齐（若可用）
+        - 保留 schema 外扩展参数，避免行为语义丢失
+        """
+        if not isinstance(tool_input, dict):
+            return {}
+        schema_cls = getattr(tool, "args_schema", None)
+        if not schema_cls:
+            return tool_input
+
+        try:
+            if hasattr(schema_cls, "model_validate"):  # Pydantic v2
+                parsed = schema_cls.model_validate(tool_input)
+                parsed_data = parsed.model_dump()
+            else:  # Pydantic v1
+                parsed = schema_cls.parse_obj(tool_input)
+                parsed_data = parsed.dict()
+
+            normalized = dict(tool_input)
+            normalized.update(parsed_data)
+            return normalized
+        except Exception:
+            # 参数校验失败时不做强制归一化，避免掩盖真实错误
+            return tool_input
+
+    def _store_shared_tool_cache(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        output: str,
+        max_entries: int = 80,
+        max_output_chars: int = 3000,
+    ) -> None:
+        """保存工具成功结果，供后续 Agent 复用。"""
+        cache_key = self._tool_cache_key(tool_name, tool_input)
+        entry = {
+            "cache_key": cache_key,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "output": str(output or "")[:max_output_chars],
+            "source_agent": self.name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._shared_tool_cache[cache_key] = entry
+        if cache_key in self._shared_tool_cache_order:
+            self._shared_tool_cache_order.remove(cache_key)
+        self._shared_tool_cache_order.append(cache_key)
+
+        # 简单 LRU 淘汰
+        while len(self._shared_tool_cache_order) > max_entries:
+            old_key = self._shared_tool_cache_order.pop(0)
+            self._shared_tool_cache.pop(old_key, None)
+
+    def load_shared_tool_cache(self, cache_blob: Any, max_entries: int = 120) -> int:
+        """
+        加载共享工具缓存。
+        支持 list[entry] 或 dict[cache_key -> entry]。
+        """
+        loaded = 0
+        if isinstance(cache_blob, dict):
+            items = list(cache_blob.values())
+        elif isinstance(cache_blob, list):
+            items = cache_blob
+        else:
+            return 0
+
+        for item in items[:max_entries]:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name") or "").strip()
+            tool_input = item.get("tool_input") if isinstance(item.get("tool_input"), dict) else {}
+            output = str(item.get("output") or "").strip()
+            if not tool_name or not output:
+                continue
+            key = self._tool_cache_key(tool_name, tool_input)
+            if key in self._shared_tool_cache:
+                continue
+            self._shared_tool_cache[key] = {
+                "cache_key": key,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "output": output,
+                "source_agent": str(item.get("source_agent") or "unknown"),
+                "created_at": str(item.get("created_at") or ""),
+            }
+            self._shared_tool_cache_order.append(key)
+            loaded += 1
+        return loaded
+
+    def export_shared_tool_cache(self, max_entries: int = 40, max_output_chars: int = 1600) -> List[Dict[str, Any]]:
+        """导出可序列化的共享工具缓存快照。"""
+        out: List[Dict[str, Any]] = []
+        for key in self._shared_tool_cache_order[-max_entries:]:
+            entry = self._shared_tool_cache.get(key)
+            if not isinstance(entry, dict):
+                continue
+            out.append(
+                {
+                    "cache_key": key,
+                    "tool_name": str(entry.get("tool_name") or ""),
+                    "tool_input": entry.get("tool_input") if isinstance(entry.get("tool_input"), dict) else {},
+                    "output": str(entry.get("output") or "")[:max_output_chars],
+                    "source_agent": str(entry.get("source_agent") or self.name),
+                    "created_at": str(entry.get("created_at") or ""),
+                }
+            )
+        return out
+
+    def get_shared_tool_cache_digest(self, max_items: int = 8, max_output_chars: int = 220) -> List[Dict[str, Any]]:
+        """生成轻量证据摘要，供 prompt 展示。"""
+        digest: List[Dict[str, Any]] = []
+        for entry in self.export_shared_tool_cache(max_entries=max_items, max_output_chars=max_output_chars):
+            digest.append(
+                {
+                    "tool_name": entry.get("tool_name"),
+                    "tool_input": entry.get("tool_input"),
+                    "output_excerpt": entry.get("output", ""),
+                    "source_agent": entry.get("source_agent", ""),
+                }
+            )
+        return digest
     
     def build_prompt_with_handoff(self, base_prompt: str) -> str:
         """
@@ -1111,6 +1260,219 @@ class BaseAgent(ABC):
             logger.warning(f"[{self.name}] Empty LLM response returned (total_tokens: {total_tokens})")
         
         return accumulated, total_tokens
+
+    @staticmethod
+    def _get_schema_field_names(schema_cls: Any) -> set[str]:
+        """提取 Pydantic schema 字段名（兼容 v1/v2）"""
+        if not schema_cls:
+            return set()
+        # Pydantic v2
+        if hasattr(schema_cls, "model_fields") and isinstance(getattr(schema_cls, "model_fields"), dict):
+            return set(getattr(schema_cls, "model_fields").keys())
+        # Pydantic v1
+        if hasattr(schema_cls, "__fields__") and isinstance(getattr(schema_cls, "__fields__"), dict):
+            return set(getattr(schema_cls, "__fields__").keys())
+        return set()
+
+    @staticmethod
+    def _get_schema_required_fields(schema_cls: Any) -> list[str]:
+        """提取 schema 的必填字段（兼容 v1/v2）"""
+        if not schema_cls:
+            return []
+        try:
+            if hasattr(schema_cls, "model_json_schema"):  # Pydantic v2
+                req = schema_cls.model_json_schema().get("required", [])
+            else:  # Pydantic v1
+                req = schema_cls.schema().get("required", [])
+            if isinstance(req, list):
+                return [str(x) for x in req]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _tool_input_example(tool_name: str, field_names: set[str], required_fields: list[str]) -> dict[str, Any]:
+        """生成工具参数示例，帮助 Agent 快速修正 Action Input"""
+        predefined: Dict[str, Dict[str, Any]] = {
+            "read_file": {"file_path": "path/to/file.ext", "start_line": 1, "end_line": 120},
+            "search_code": {"keyword": "search_term", "directory": ".", "file_pattern": "*.php", "max_results": 20},
+            "list_files": {"directory": ".", "recursive": False, "max_files": 100},
+            "pattern_match": {"scan_file": "path/to/file.ext", "pattern_types": ["sql_injection"]},
+            "code_analysis": {"file_path": "path/to/file.ext", "start_line": 1, "end_line": 200, "language": "php"},
+            "dataflow_analysis": {
+                "source_code": "source snippet",
+                "variable_name": "user_input",
+                "sink_code": "sink snippet",
+                "file_path": "path/to/file.ext",
+            },
+            "vulnerability_validation": {
+                "file_path": "path/to/file.ext",
+                "vulnerability_type": "sql_injection",
+                "code": "suspicious code",
+            },
+            "smart_scan": {"target": ".", "scan_types": ["pattern"], "max_files": 50},
+            "quick_audit": {"file_path": "path/to/file.ext", "deep_analysis": True},
+            "extract_function": {"file_path": "path/to/file.ext", "function_name": "target_func", "include_imports": True},
+            "run_code": {"code": "print('hello')", "language": "python", "timeout": 60},
+            "sandbox_exec": {"command": "python3 -c \"print(1)\"", "timeout": 30},
+            "sandbox_http": {"method": "GET", "url": "http://localhost:8080/", "timeout": 30},
+            "verify_vulnerability": {
+                "vulnerability_type": "sql_injection",
+                "target_url": "http://localhost/search",
+                "payload": "1' OR '1'='1",
+            },
+            "php_test": {"file_path": "vuln.php", "get_params": {"cmd": "id"}, "timeout": 30},
+            "test_command_injection": {"target_file": "vuln.php", "param_name": "cmd", "test_command": "id", "language": "php"},
+        }
+        if tool_name in predefined:
+            return predefined[tool_name]
+
+        merged_fields: list[str] = []
+        for f in required_fields + sorted(field_names):
+            if f not in merged_fields:
+                merged_fields.append(f)
+        if not merged_fields:
+            return {}
+
+        placeholder_map: Dict[str, Any] = {
+            "file_path": "path/to/file.ext",
+            "start_line": 1,
+            "end_line": 50,
+            "line": 1,
+            "directory": ".",
+            "target_path": ".",
+            "query": "search query",
+            "keyword": "search_term",
+            "pattern": "keyword_or_regex",
+            "regex": "regex_pattern",
+            "code": "code snippet",
+            "scan_file": "path/to/file.ext",
+            "source_code": "source snippet",
+            "sink_code": "sink snippet",
+            "variable_name": "user_input",
+            "vulnerability_type": "sql_injection",
+            "max_lines": 200,
+            "max_results": 20,
+            "max_files": 100,
+            "language": "php",
+            "timeout": 60,
+            "recursive": False,
+            "file_pattern": "*.php",
+            "function_name": "target_func",
+            "include_imports": True,
+            "target_url": "http://localhost/test",
+            "payload": "test_payload",
+            "method": "GET",
+            "url": "http://localhost:8080/",
+            "command": "echo test",
+            "deep_analysis": True,
+            "target_file": "vuln.php",
+            "param_name": "cmd",
+            "test_command": "id",
+            "scan_types": ["pattern"],
+            "focus_vulnerabilities": ["sql_injection"],
+            "pattern_types": ["sql_injection"],
+        }
+
+        sample: Dict[str, Any] = {}
+        for key in merged_fields[:6]:
+            sample[key] = placeholder_map.get(key, "value")
+        return sample
+
+    def _build_tool_format_feedback(
+        self,
+        tool_name: str,
+        tool: Any,
+        tool_input: Dict[str, Any],
+        format_note: Optional[str] = None,
+    ) -> str:
+        """构建面向 Agent 的 Action Input 格式纠错提示"""
+        schema_cls = getattr(tool, "args_schema", None)
+        field_names = sorted(self._get_schema_field_names(schema_cls))
+        required_fields = self._get_schema_required_fields(schema_cls)
+        current_keys = list(tool_input.keys()) if isinstance(tool_input, dict) else []
+
+        lines: list[str] = ["⚠️ Action Input 格式纠错指引"]
+        if format_note:
+            lines.append(f"- 检测到的问题: {format_note}")
+        if isinstance(tool_input, dict) and isinstance(tool_input.get("items"), list):
+            lines.append("- 不要使用 `{\"items\": [...]}` 包装；Action Input 必须是单个 JSON 对象。")
+        if isinstance(tool_input, dict) and "raw_input" in tool_input:
+            lines.append("- 当前 Action Input 未被解析为有效 JSON 对象，请仅输出严格 JSON。")
+        if required_fields:
+            lines.append(f"- 必填参数: {', '.join(required_fields)}")
+        if field_names:
+            lines.append(f"- 可用参数: {', '.join(field_names[:12])}")
+        if current_keys:
+            lines.append(f"- 你当前传入的顶层键: {', '.join(current_keys[:12])}")
+        example = self._tool_input_example(tool_name, set(field_names), required_fields)
+        if example:
+            lines.append(f"- 正确示例: Action Input: {json.dumps(example, ensure_ascii=False)}")
+        lines.append("- 输出格式必须严格为: `Action Input: { ... }`（一个 JSON 对象）")
+        return "\n".join(lines)
+
+    def _normalize_tool_input(
+        self,
+        tool_name: str,
+        tool: Any,
+        tool_input: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        """
+        兼容异常 Action Input 结构：
+        - 某些 LLM 会把多个 JSON 对象修复成 {"items":[{...},{...}]}
+        - 对于需要扁平参数的工具（如 read_file），自动抽取最匹配的第一项
+        """
+        if not isinstance(tool_input, dict):
+            return {}, "Action Input 不是 JSON 对象"
+
+        schema_cls = getattr(tool, "args_schema", None)
+        field_names = self._get_schema_field_names(schema_cls)
+        if not field_names:
+            return tool_input, None
+
+        # 顶层已经包含 schema 字段，保持原样
+        if any(k in field_names for k in tool_input.keys()):
+            note = None
+            if isinstance(tool_input.get("items"), list):
+                note = "顶层参数有效，但包含多余 items 包装字段"
+            return tool_input, note
+
+        if "raw_input" in tool_input:
+            return tool_input, "Action Input JSON 解析失败，当前仅保留 raw_input"
+
+        items = tool_input.get("items")
+        if not isinstance(items, list):
+            return tool_input, None
+
+        best_item: Optional[Dict[str, Any]] = None
+        best_score = 0
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            score = sum(1 for k in entry.keys() if k in field_names)
+            if score > best_score:
+                best_score = score
+                best_item = entry
+
+        if not best_item or best_score <= 0:
+            return tool_input, "检测到 items 包装，但其中对象与工具参数不匹配"
+
+        normalized: Dict[str, Any] = {}
+        # 仅保留 schema 识别字段，避免把噪音 key 传入工具
+        for k, v in best_item.items():
+            if k in field_names:
+                normalized[k] = v
+
+        if normalized:
+            note = (
+                f"检测到 items 包装，已自动提取参数字段 {list(normalized.keys())}"
+            )
+            logger.warning(
+                f"[{self.name}] Tool '{tool_name}' action input auto-normalized from items[] "
+                f"(matched_fields={best_score}, fields={list(normalized.keys())})"
+            )
+            return normalized, note
+        return tool_input, "检测到 items 包装，但未提取到有效参数字段"
     
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """
@@ -1133,11 +1495,37 @@ class BaseAgent(ABC):
             return f"错误: 工具 '{tool_name}' 不存在。可用工具: {list(self.tools.keys())}"
 
         try:
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            tool_input, format_note = self._normalize_tool_input(tool_name, tool, tool_input)
+            cache_tool_input = self._canonicalize_tool_input_for_cache(tool, tool_input)
+
             self._tool_calls += 1
             await self.emit_tool_call(tool_name, tool_input)
 
             import time
             start = time.time()
+
+            # 优先复用共享缓存，避免跨 Agent 重复执行同一工具调用
+            cache_key = self._tool_cache_key(tool_name, cache_tool_input)
+            cached = self._shared_tool_cache.get(cache_key)
+            if isinstance(cached, dict) and str(cached.get("output") or "").strip():
+                self._shared_tool_cache_hits += 1
+                duration_ms = int((time.time() - start) * 1000)
+                cached_output = str(cached.get("output") or "")
+                source_agent = str(cached.get("source_agent") or "previous_agent")
+                await self.emit_tool_result(tool_name, f"cache_hit from {source_agent}", duration_ms)
+                await self.emit_event(
+                    "tool_cache_hit",
+                    f"[{self.name}] 复用共享缓存: {tool_name}",
+                    tool_name=tool_name,
+                    metadata={
+                        "tool_name": tool_name,
+                        "cache_source_agent": source_agent,
+                        "cache_hits": self._shared_tool_cache_hits,
+                    },
+                )
+                return f"♻️ 复用前序工具结果（来源: {source_agent}）\n\n{cached_output}"
 
             # 🔥 根据工具类型设置不同的超时时间
             tool_timeouts = {
@@ -1216,6 +1604,8 @@ class BaseAgent(ABC):
 
             if result.success:
                 output = str(result.data)
+                if format_note:
+                    output = f"ℹ️ 参数格式反馈: {format_note}\n\n{output}"
 
                 # 包含 metadata 中的额外信息
                 if result.metadata:
@@ -1227,8 +1617,23 @@ class BaseAgent(ABC):
                 # 截断过长输出
                 if len(output) > 6000:
                     output = output[:6000] + f"\n\n... [输出已截断，共 {len(str(result.data))} 字符]"
+
+                # 仅缓存成功结果，供后续 Agent 复用
+                self._store_shared_tool_cache(
+                    tool_name=tool_name,
+                    tool_input=cache_tool_input,
+                    output=output,
+                )
                 return output
             else:
+                format_feedback = ""
+                if format_note or ("参数校验失败" in str(result.error or "")):
+                    format_feedback = "\n\n" + self._build_tool_format_feedback(
+                        tool_name=tool_name,
+                        tool=tool,
+                        tool_input=tool_input,
+                        format_note=format_note,
+                    )
                 # 🔥 输出详细的错误信息，包括原始错误
                 error_msg = f"""⚠️ 工具执行失败
 
@@ -1236,7 +1641,7 @@ class BaseAgent(ABC):
 **参数**: {json.dumps(tool_input, ensure_ascii=False, indent=2) if tool_input else '无'}
 **错误**: {result.error}
 
-请根据错误信息调整参数或尝试其他方法。"""
+请根据错误信息调整参数或尝试其他方法。{format_feedback}"""
                 return error_msg
 
         except asyncio.CancelledError:
@@ -1269,6 +1674,29 @@ class BaseAgent(ABC):
         for name, tool in self.tools.items():
             if name.startswith("_"):
                 continue
-            desc = f"- {name}: {getattr(tool, 'description', 'No description')}"
-            tools_info.append(desc)
+            raw_desc = str(getattr(tool, "description", "No description") or "").strip()
+            first_line = ""
+            for ln in raw_desc.splitlines():
+                ln = ln.strip()
+                if ln:
+                    first_line = ln
+                    break
+            if not first_line:
+                first_line = "No description"
+            if len(first_line) > 160:
+                first_line = first_line[:160] + "..."
+
+            schema_cls = getattr(tool, "args_schema", None)
+            field_names = sorted(self._get_schema_field_names(schema_cls))
+            required_fields = self._get_schema_required_fields(schema_cls)
+            sample = self._tool_input_example(name, set(field_names), required_fields)
+
+            line = f"- {name}: {first_line}"
+            if required_fields:
+                line += f" | 必填: {', '.join(required_fields)}"
+            elif field_names:
+                line += f" | 参数: {', '.join(field_names[:8])}"
+            if sample:
+                line += f"\n  示例: {json.dumps(sample, ensure_ascii=False)}"
+            tools_info.append(line)
         return "\n".join(tools_info)

@@ -5,6 +5,7 @@
 
 import json
 import logging
+import os
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
@@ -15,8 +16,16 @@ logger = logging.getLogger(__name__)
 
 class CodeAnalysisInput(BaseModel):
     """代码分析输入"""
-    code: str = Field(description="要分析的代码内容")
-    file_path: str = Field(default="unknown", description="文件路径")
+    code: Optional[str] = Field(
+        default=None,
+        description="要分析的代码内容（可选；与 file_path 二选一）"
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="文件路径（可选；与 code 二选一）"
+    )
+    start_line: Optional[int] = Field(default=None, description="可选，起始行号（与 file_path 配合）")
+    end_line: Optional[int] = Field(default=None, description="可选，结束行号（与 file_path 配合）")
     language: str = Field(default="python", description="编程语言")
     focus: Optional[str] = Field(
         default=None,
@@ -34,15 +43,17 @@ class CodeAnalysisTool(AgentTool):
     使用 LLM 对代码进行深度安全分析
     """
     
-    def __init__(self, llm_service):
+    def __init__(self, llm_service, project_root: Optional[str] = None):
         """
         初始化代码分析工具
         
         Args:
             llm_service: LLM 服务实例
+            project_root: 项目根目录（用于仅传 file_path 时自动读取代码）
         """
         super().__init__()
         self.llm_service = llm_service
+        self.project_root = project_root
     
     @property
     def name(self) -> str:
@@ -60,8 +71,9 @@ class CodeAnalysisTool(AgentTool):
 - 生成详细的漏洞报告和修复建议
 
 输入:
-- code: 要分析的代码
-- file_path: 文件路径
+- code: 要分析的代码（可选；与 file_path 二选一）
+- file_path: 文件路径（可选；与 code 二选一）
+- start_line/end_line: 可选行范围（与 file_path 配合）
 - language: 编程语言
 - focus: 可选，重点关注的漏洞类型
 - context: 可选，额外的上下文代码
@@ -74,8 +86,10 @@ class CodeAnalysisTool(AgentTool):
     
     async def _execute(
         self,
-        code: str,
-        file_path: str = "unknown",
+        code: Optional[str] = None,
+        file_path: Optional[str] = None,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
         language: str = "python",
         focus: Optional[str] = None,
         context: Optional[str] = None,
@@ -85,15 +99,36 @@ class CodeAnalysisTool(AgentTool):
         import asyncio
         
         try:
+            file_path_str = str(file_path or "").strip()
+            code_text = str(code or "").strip()
+            if not code_text:
+                if not file_path_str:
+                    return ToolResult(
+                        success=False,
+                        error="缺少参数：请提供 code，或提供 file_path（可选 start_line/end_line）。",
+                    )
+                loaded_code, load_err = self._load_code_from_file(
+                    file_path=file_path_str,
+                    start_line=start_line,
+                    end_line=end_line,
+                )
+                if load_err:
+                    return ToolResult(success=False, error=load_err)
+                code_text = loaded_code
+                if language == "python":
+                    inferred = self._infer_language_from_path(file_path_str)
+                    if inferred:
+                        language = inferred
+
             # 限制代码长度，避免超时
             max_code_length = 50000  # 约 50KB
-            if len(code) > max_code_length:
-                code = code[:max_code_length] + "\n\n... (代码已截断，仅分析前 50000 字符)"
+            if len(code_text) > max_code_length:
+                code_text = code_text[:max_code_length] + "\n\n... (代码已截断，仅分析前 50000 字符)"
             
             # 添加超时保护（5分钟）
             try:
                 analysis = await asyncio.wait_for(
-                    self.llm_service.analyze_code(code, language),
+                    self.llm_service.analyze_code(code_text, language),
                     timeout=300.0  # 5分钟超时
                 )
             except asyncio.TimeoutError:
@@ -103,22 +138,23 @@ class CodeAnalysisTool(AgentTool):
                 )
             
             issues = analysis.get("issues", [])
+            display_file_path = file_path_str or "unknown"
             
             if not issues:
                 return ToolResult(
                     success=True,
                     data="代码分析完成，未发现明显的安全问题。\n\n"
                          f"质量评分: {analysis.get('quality_score', 'N/A')}\n"
-                         f"文件: {file_path}",
+                         f"文件: {display_file_path}",
                     metadata={
-                        "file_path": file_path,
+                        "file_path": display_file_path,
                         "issues_count": 0,
                         "quality_score": analysis.get("quality_score"),
                     }
                 )
             
             # 格式化输出
-            output_parts = [f"🔍 代码分析结果 - {file_path}\n"]
+            output_parts = [f"🔍 代码分析结果 - {display_file_path}\n"]
             output_parts.append(f"发现 {len(issues)} 个问题:\n")
             
             for i, issue in enumerate(issues):
@@ -150,7 +186,7 @@ class CodeAnalysisTool(AgentTool):
                 success=True,
                 data="\n".join(output_parts),
                 metadata={
-                    "file_path": file_path,
+                    "file_path": display_file_path,
                     "issues_count": len(issues),
                     "quality_score": analysis.get("quality_score"),
                     "issues": issues,
@@ -168,6 +204,60 @@ class CodeAnalysisTool(AgentTool):
                 success=False,
                 error=f"代码分析失败: {str(e)}",
             )
+
+    def _load_code_from_file(
+        self,
+        file_path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> tuple[str, Optional[str]]:
+        """当只提供 file_path 时，自动读取代码内容。"""
+        if not self.project_root:
+            return "", "code_analysis 未配置 project_root，无法仅凭 file_path 读取代码。"
+
+        if not file_path:
+            return "", "file_path 不能为空。"
+
+        root = os.path.realpath(self.project_root)
+        full_path = os.path.realpath(os.path.join(root, file_path))
+        if not full_path.startswith(root):
+            return "", "安全错误：不允许读取项目目录外的文件。"
+        if not os.path.exists(full_path) or not os.path.isfile(full_path):
+            return "", f"文件不存在: {file_path}"
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception as exc:
+            return "", f"读取文件失败: {exc}"
+
+        total = len(lines)
+        s = 1 if start_line is None else max(1, int(start_line))
+        e = total if end_line is None else min(total, int(end_line))
+        if e < s:
+            return "", f"无效行范围: start_line={s}, end_line={e}"
+
+        snippet = "".join(lines[s - 1:e]).strip()
+        if not snippet:
+            return "", f"读取到空代码片段: {file_path}:{s}-{e}"
+        return snippet, None
+
+    @staticmethod
+    def _infer_language_from_path(file_path: str) -> Optional[str]:
+        ext = os.path.splitext(file_path.lower())[1]
+        mapping = {
+            ".php": "php",
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".java": "java",
+            ".go": "go",
+            ".rb": "ruby",
+            ".sh": "bash",
+        }
+        return mapping.get(ext)
 
 
 class DataFlowAnalysisInput(BaseModel):
@@ -595,4 +685,3 @@ class VulnerabilityValidationTool(AgentTool):
                 success=False,
                 error=f"漏洞验证失败: {str(e)}",
             )
-

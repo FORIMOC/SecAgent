@@ -88,7 +88,7 @@ class DynamicAgentExecutor:
         tools: Dict[str, Any],
         event_emitter=None,
         max_parallel: int = 5,
-        default_timeout: int = 600,
+        default_timeout: int = 1800,
     ):
         """
         初始化执行器

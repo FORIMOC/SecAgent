@@ -241,8 +241,36 @@ class OrchestratorAgent(BaseAgent):
 
         compact_context = dict(handoff.context_data or {})
         # Keep only lightweight context keys that are useful cross-agent.
-        allowed = {"tech_stack", "project_structure", "dependencies", "recon_tech_stack", "recon_entry_points"}
+        allowed = {
+            "tech_stack",
+            "project_structure",
+            "dependencies",
+            "recon_tech_stack",
+            "recon_entry_points",
+            "shared_tool_cache",
+            "analysis_tool_evidence",
+        }
         compact_context = {k: v for k, v in compact_context.items() if k in allowed}
+
+        # 进一步压缩共享工具缓存，防止上下文膨胀
+        if isinstance(compact_context.get("shared_tool_cache"), list):
+            compact_cache: list[dict[str, Any]] = []
+            for item in compact_context["shared_tool_cache"][:30]:
+                if not isinstance(item, dict):
+                    continue
+                compact_cache.append(
+                    {
+                        "tool_name": str(item.get("tool_name") or "")[:60],
+                        "tool_input": item.get("tool_input") if isinstance(item.get("tool_input"), dict) else {},
+                        "output": str(item.get("output") or "")[:900],
+                        "source_agent": str(item.get("source_agent") or "")[:40],
+                    }
+                )
+            compact_context["shared_tool_cache"] = compact_cache
+        if isinstance(compact_context.get("analysis_tool_evidence"), list):
+            compact_context["analysis_tool_evidence"] = [
+                x for x in compact_context["analysis_tool_evidence"][:10] if isinstance(x, dict)
+            ]
 
         return TaskHandoff(
             from_agent=handoff.from_agent,
@@ -694,23 +722,33 @@ Action Input: {{"参数": "值"}}
         """解析 LLM 响应"""
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
         cleaned_response = response
-        cleaned_response = re.sub(r'\*\*Action:\*\*', 'Action:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Action Input:\*\*', 'Action Input:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Thought:\*\*', 'Thought:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Observation:\*\*', 'Observation:', cleaned_response)
+        cleaned_response = re.sub(r'\*\*Action\s*[:：]\s*\*\*', 'Action:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Action Input\s*[:：]\s*\*\*', 'Action Input:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Thought\s*[:：]\s*\*\*', 'Thought:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Observation\s*[:：]\s*\*\*', 'Observation:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'(?im)^\s*Thought\s*[：]\s*', 'Thought: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Action Input\s*[：]\s*', 'Action Input: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Action\s*[：]\s*', 'Action: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Observation\s*[：]\s*', 'Observation: ', cleaned_response)
 
         # 提取 Thought
-        thought_match = re.search(r'Thought:\s*(.*?)(?=Action:|$)', cleaned_response, re.DOTALL)
+        thought_match = re.search(
+            r'(?is)(?:^|\n)\s*Thought:\s*(.*?)(?=(?:\n\s*Action\s*:)|\Z)',
+            cleaned_response,
+        )
         thought = thought_match.group(1).strip() if thought_match else ""
 
         # 提取 Action
-        action_match = re.search(r'Action:\s*(\w+)', cleaned_response)
+        action_match = re.search(r'(?im)(?:^|\n)\s*Action:\s*`?([A-Za-z_][A-Za-z0-9_-]*)`?', cleaned_response)
         if not action_match:
             return None
         action = action_match.group(1).strip()
 
         # 提取 Action Input
-        input_match = re.search(r'Action Input:\s*(.*?)(?=Thought:|Observation:|$)', cleaned_response, re.DOTALL)
+        input_match = re.search(
+            r'(?is)(?:^|\n)\s*Action Input:\s*(.*?)(?=(?:\n\s*(?:Thought|Action|Observation)\s*:)|\Z)',
+            cleaned_response,
+        )
         if not input_match:
             return None
 
@@ -860,7 +898,7 @@ Action Input: {{"参数": "值"}}
 
             # 🔥 执行子 Agent - 支持取消和超时
             # 使用用户配置的子Agent超时时间
-            default_sub_agent_timeout = self._timeout_config.get('sub_agent_timeout', 600)
+            default_sub_agent_timeout = self._timeout_config.get('sub_agent_timeout', 1800)
             # 设置子 Agent 超时（根据 Agent 类型，recon稍短）
             agent_timeouts = {
                 "recon": min(300, default_sub_agent_timeout),  # recon 通常较快
@@ -1578,6 +1616,13 @@ Action Input: {{"参数": "值"}}
                 analysis_data = self._agent_results["analysis"]
 
                 work_completed.append("完成代码深度分析")
+
+                # 将 Analysis 可复用工具证据传递给 Verification
+                if isinstance(analysis_data, dict):
+                    if isinstance(analysis_data.get("shared_tool_cache"), list):
+                        context_data["shared_tool_cache"] = analysis_data.get("shared_tool_cache", [])
+                    if isinstance(analysis_data.get("tool_cache_digest"), list):
+                        context_data["analysis_tool_evidence"] = analysis_data.get("tool_cache_digest", [])
 
                 findings = analysis_data.get("findings", [])
                 if findings:

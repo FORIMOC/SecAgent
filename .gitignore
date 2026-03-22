@@ -1,5 +1,15 @@
+# JB IDE 配置
+.idea/
+# mac 生成
+**/.DS_Store
+# Python 生成
+**/__pycache__/
+**/*.egg-info/
+/.venv
+
+# 项目中的数据
+**/workspace/
 /data/repos/
 /data/logs/
+/data/verify
 /data/input/4369.json
-
-/.venv

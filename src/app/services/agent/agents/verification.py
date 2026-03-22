@@ -67,6 +67,16 @@ def _build_brief_handoff_context(handoff: TaskHandoff | None) -> str:
         lines.append("### 优先文件")
         for a in handoff.priority_areas[:6]:
             lines.append(f"- {str(a)[:180]}")
+    ctx = handoff.context_data if isinstance(handoff.context_data, dict) else {}
+    evidence = ctx.get("analysis_tool_evidence")
+    if isinstance(evidence, list) and evidence:
+        lines.append("### Analysis 已有工具证据（可复用）")
+        for item in evidence[:6]:
+            if not isinstance(item, dict):
+                continue
+            tn = str(item.get("tool_name") or "")
+            out = str(item.get("output_excerpt") or "")[:140]
+            lines.append(f"- [{tn}] {out}")
     return "\n".join(lines)
 
 
@@ -183,6 +193,15 @@ def _collect_code_mismatch_details(findings: list[Dict[str, Any]], project_root:
                 continue
             real = _read_file_range(project_root, node_file, start_line, end_line)
             if not real:
+                kind = str(node.get("kind") or node.get("Type") or "unknown").strip()
+                details.append(
+                    f"finding#{fidx} node#{nidx} ({kind}) @ {node_file}:{start_line}-{end_line}\n"
+                    "提交code: "
+                    + code[:220]
+                    + "\n文件代码: <unreadable: file/range not readable>"
+                )
+                if len(details) >= limit:
+                    return details
                 continue
             if _normalize_code(code) in _normalize_code(real):
                 continue
@@ -230,12 +249,30 @@ def _locate_code_range_in_file(project_root: str, file_path: str, code: str) -> 
             end = start + segment.count("\n")
             return start, end
 
+    # 3) single-line fallback by strict normalized containment
     target = _normalize_code(code)
     if target:
         for i, line in enumerate(text.splitlines(), start=1):
             nline = _normalize_code(line)
-            if target in nline or nline in target:
+            if nline and target in nline:
                 return i, i
+
+    # 4) conservative token-overlap fallback (avoid drifting to weakly-related lines)
+    tokens = _code_tokens(code)
+    if tokens:
+        best_line = None
+        best_overlap = 0
+        for i, line in enumerate(text.splitlines(), start=1):
+            lt = _code_tokens(line)
+            if not lt:
+                continue
+            overlap = len(tokens & lt)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_line = i
+        min_overlap = max(2, min(4, len(tokens) // 2))
+        if best_line and best_overlap >= min_overlap:
+            return best_line, best_line
     return None
 
 
@@ -411,7 +448,8 @@ VERIFICATION_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞验证 Agent，一个*
 - **run_code**: 执行你编写的测试代码（支持 Python/PHP/JS/Ruby/Go/Java/Bash）
   - 用于运行 Fuzzing Harness、PoC 脚本
   - 你可以完全控制测试逻辑
-  - 参数: code (str), language (str), timeout (int), description (str)
+  - 参数: code (str), language (str), runtime_version (str, 可选), docker_image (str, 可选), timeout (int), description (str)
+  - 镜像选择: 默认按 language+version 自动选镜像；如果环境需要，优先传 docker_image 指定镜像
 
 - **extract_function**: 从源文件提取指定函数代码
   - 用于获取目标函数，构建 Fuzzing Harness
@@ -419,7 +457,7 @@ VERIFICATION_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞验证 Agent，一个*
 
 ### 文件操作
 - **read_file**: 读取代码文件获取上下文
-  参数: file_path (str), start_line (int), end_line (int)
+  参数: file_path (str), start_line (int, 可选), end_line (int, 可选)
 
 ### 沙箱工具
 - **sandbox_exec**: 在沙箱中执行命令（用于验证命令执行类漏洞）
@@ -607,6 +645,8 @@ Action Input: {"file_path": "search.php"}
 1. 不要在 Thought:、Action:、Action Input:、Final Answer: 前后添加 `**`
 2. 不要使用其他 Markdown 格式（如 `###`、`*斜体*` 等）
 3. Action Input 必须是完整的 JSON 对象，不能为空或截断
+4. 单轮输出必须二选一：`Thought+Action+Action Input` 或 `Thought+Final Answer`
+5. 禁止在同一轮里同时输出 `Action` 和 `Final Answer`
 
 ## Final Answer 格式
 ```json
@@ -647,6 +687,7 @@ Action Input: {"file_path": "search.php"}
 2. `Final Answer:` 后面必须是可被 `json.loads` 直接解析的单个 JSON 对象
 3. 禁止输出 Markdown 代码块（```json）、注释、`...`、尾随解释文本
 4. 不要分多次补充字段；缺失字段也要给空值（`[]`、`""`、`null`）
+5. 提交 Final Answer 的这一轮，不要再输出 Action 或 Action Input
 
 ## 验证判定标准
 - **confirmed**: 漏洞确认存在且可利用，有明确证据（如 Harness 成功触发）
@@ -687,7 +728,8 @@ read_file 返回: "文件不存在"
 3. **PoC 必须完整可执行** - poc.payload 应该是可直接运行的代码
 4. **不要假设环境** - 沙箱中没有运行的服务，需要 mock
 5. **节点顺序要求** - 如果给出 `source_to_sink_path`，必须严格按 `source -> propagation -> sink` 顺序提交
-6. **Final Answer 前逐节点自检** - 对每个节点执行 `read_file(File, StartLine, EndLine)`，确认返回内容包含该节点 code；不满足则先修正行号或 code 再提交
+6. **Final Answer 前逐节点自检** - 对每个节点执行 `read_file(file_path=File, start_line=StartLine, end_line=EndLine)`，确认返回内容包含该节点 code；不满足则先修正行号或 code 再提交
+7. **Desc 必须语义化** - `source_to_sink_path[].Desc` 必须明确说明该节点如何传播污点，并包含真实变量名 + 函数/操作名，禁止模板化空泛描述
 
 ## 重要原则
 1. **你是验证的大脑** - 你决定如何测试，工具只提供执行能力
@@ -752,20 +794,36 @@ class VerificationAgent(BaseAgent):
 
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
         cleaned_response = response
-        cleaned_response = re.sub(r'\*\*Action:\*\*', 'Action:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Action Input:\*\*', 'Action Input:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Thought:\*\*', 'Thought:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Final Answer:\*\*', 'Final Answer:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Observation:\*\*', 'Observation:', cleaned_response)
+        cleaned_response = re.sub(r'\*\*Action\s*[:：]\s*\*\*', 'Action:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Action Input\s*[:：]\s*\*\*', 'Action Input:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Thought\s*[:：]\s*\*\*', 'Thought:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Final Answer\s*[:：]\s*\*\*', 'Final Answer:', cleaned_response, flags=re.IGNORECASE)
+        cleaned_response = re.sub(r'\*\*Observation\s*[:：]\s*\*\*', 'Observation:', cleaned_response, flags=re.IGNORECASE)
+        # 兼容中文冒号与行首前缀变体
+        cleaned_response = re.sub(r'(?im)^\s*Thought\s*[：]\s*', 'Thought: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Action Input\s*[：]\s*', 'Action Input: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Action\s*[：]\s*', 'Action: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Final Answer\s*[：]\s*', 'Final Answer: ', cleaned_response)
+        cleaned_response = re.sub(r'(?im)^\s*Observation\s*[：]\s*', 'Observation: ', cleaned_response)
 
         # 🔥 首先尝试提取明确的 Thought 标记
-        thought_match = re.search(r'Thought:\s*(.*?)(?=Action:|Final Answer:|$)', cleaned_response, re.DOTALL)
+        thought_match = re.search(r'(?is)(?:^|\n)\s*Thought:\s*(.*?)(?=(?:\n\s*(?:Action|Final Answer)\s*:)|\Z)', cleaned_response)
         if thought_match:
             step.thought = thought_match.group(1).strip()
 
-        # 🔥 检查是否是最终答案
-        final_match = re.search(r'Final Answer:\s*(.*?)$', cleaned_response, re.DOTALL)
-        if final_match:
+        # 先解析 Action/Final 的位置，避免同时出现时误判为 Final
+        action_match = re.search(r'(?im)(?:^|\n)\s*Action:\s*`?([A-Za-z_][A-Za-z0-9_-]*)`?', cleaned_response)
+        final_match = re.search(r'(?is)(?:^|\n)\s*Final Answer:\s*(.*)$', cleaned_response)
+        action_pos = action_match.start() if action_match else -1
+        final_pos = final_match.start() if final_match else -1
+        should_parse_final = bool(
+            final_match and (
+                not action_match or (final_pos >= 0 and final_pos < action_pos)
+            )
+        )
+
+        # 🔥 检查是否是最终答案（仅当 Final 先于 Action 或无 Action）
+        if should_parse_final:
             step.is_final = True
             answer_text = final_match.group(1).strip()
             answer_text = re.sub(r'```json\s*', '', answer_text)
@@ -792,13 +850,11 @@ class VerificationAgent(BaseAgent):
             return step
 
         # 🔥 提取 Action
-        action_match = re.search(r'Action:\s*(\w+)', cleaned_response)
         if action_match:
             step.action = action_match.group(1).strip()
 
             # 🔥 如果没有提取到 thought，提取 Action 之前的内容作为思考
             if not step.thought:
-                action_pos = cleaned_response.find('Action:')
                 if action_pos > 0:
                     before_action = cleaned_response[:action_pos].strip()
                     before_action = re.sub(r'^Thought:\s*', '', before_action)
@@ -806,7 +862,10 @@ class VerificationAgent(BaseAgent):
                         step.thought = before_action[:500] if len(before_action) > 500 else before_action
 
         # 🔥 提取 Action Input - 增强版，处理多种格式
-        input_match = re.search(r'Action Input:\s*(.*?)(?=Thought:|Action:|Observation:|$)', cleaned_response, re.DOTALL)
+        input_match = re.search(
+            r'(?is)(?:^|\n)\s*Action Input:\s*(.*?)(?=(?:\n\s*(?:Thought|Action|Observation|Final Answer)\s*:)|\Z)',
+            cleaned_response,
+        )
         if input_match:
             input_text = input_match.group(1).strip()
             input_text = re.sub(r'```json\s*', '', input_text)
@@ -854,6 +913,28 @@ class VerificationAgent(BaseAgent):
             if isinstance(handoff, dict):
                 handoff = TaskHandoff.from_dict(handoff)
             self.receive_handoff(handoff)
+
+        # 从 previous_results 中补充加载 Analysis 的共享工具缓存（handoff 不可用时兜底）
+        shared_cache_before = len(self._shared_tool_cache)
+        try:
+            if isinstance(previous_results, dict):
+                # 常见格式: previous_results["analysis"] = {"data": {...}}
+                analysis_entry = previous_results.get("analysis")
+                if isinstance(analysis_entry, dict):
+                    analysis_data = analysis_entry.get("data", analysis_entry)
+                    if isinstance(analysis_data, dict):
+                        for cache_key in ("shared_tool_cache", "tool_cache"):
+                            cache_blob = analysis_data.get(cache_key)
+                            if cache_blob:
+                                self.load_shared_tool_cache(cache_blob)
+                # 兼容直接挂在 previous_results 顶层
+                for cache_key in ("shared_tool_cache", "tool_cache"):
+                    cache_blob = previous_results.get(cache_key)
+                    if cache_blob:
+                        self.load_shared_tool_cache(cache_blob)
+        except Exception as e:
+            logger.debug(f"[Verification] Failed loading shared cache from previous_results: {e}")
+        shared_cache_loaded = max(0, len(self._shared_tool_cache) - shared_cache_before)
         
         # 收集所有待验证的发现
         findings_to_verify = []
@@ -952,6 +1033,23 @@ class VerificationAgent(BaseAgent):
         
         # 🔥 构建包含交接上下文的初始消息
         handoff_context = _build_brief_handoff_context(self._incoming_handoff)
+        shared_evidence = self.get_shared_tool_cache_digest(max_items=8)
+        shared_evidence_text = ""
+        if shared_evidence:
+            lines = ["## 可复用的前序工具证据（Analysis -> Verification）"]
+            for idx, item in enumerate(shared_evidence, 1):
+                if not isinstance(item, dict):
+                    continue
+                tn = str(item.get("tool_name") or "tool")
+                excerpt = str(item.get("output_excerpt") or "").replace("\n", " ").strip()[:180]
+                lines.append(f"{idx}. [{tn}] {excerpt}")
+            lines.append("说明: 对完全相同的工具+参数调用会自动命中共享缓存，避免重复执行。")
+            shared_evidence_text = "\n".join(lines)
+        if shared_cache_loaded > 0:
+            await self.emit_event(
+                "info",
+                f"已从前序结果加载 {shared_cache_loaded} 条可复用工具证据缓存"
+            )
         
         findings_summary = []
         for i, f in enumerate(findings_to_verify):
@@ -996,6 +1094,7 @@ class VerificationAgent(BaseAgent):
         initial_message = f"""请验证以下 {len(findings_to_verify)} 个安全发现。
 
 {handoff_context if handoff_context else ''}
+{shared_evidence_text if shared_evidence_text else ''}
 
 ## 待验证发现
 {''.join(findings_summary)}
@@ -1005,6 +1104,7 @@ class VerificationAgent(BaseAgent):
 2. **如果文件路径包含冒号和行号** (如 "app.py:36"), 请提取文件名 "app.py" 并使用 read_file 读取
 3. **先读取文件内容，再判断漏洞是否存在**
 4. **不要假设文件在子目录中** - 使用发现中提供的精确路径
+5. **优先复用前序证据** - 若上方已有 Analysis 工具结果，先基于这些证据推进；仅在缺少关键证据时再调用新工具
 
 ## 验证要求
 - 验证级别: {config.get('verification_level', 'standard')}
@@ -1119,16 +1219,20 @@ class VerificationAgent(BaseAgent):
                             if not ok:
                                 invalids.append(f"finding#{idx}: {reason}")
                         if invalids:
-                            mismatch_invalids = [
+                            path_invalids = [
                                 x for x in invalids
-                                if ("code not found in file range" in x or "code unrelated to file range" in x)
+                                if (
+                                    "code not found in file range" in x
+                                    or "code unrelated to file range" in x
+                                    or "file/range unreadable" in x
+                                )
                             ]
-                            if mismatch_invalids:
+                            if path_invalids:
                                 self._code_mismatch_retries += 1
                             else:
                                 self._code_mismatch_retries = 0
-                            # 稳定性兜底：连续多次仅因 code/line 不匹配失败时，直接按行号范围回填 code 再验证，避免长时间循环。
-                            if self._code_mismatch_retries >= 6 and len(mismatch_invalids) == len(invalids):
+                            # 稳定性兜底：连续多次因路径节点不可对齐失败时，直接按行号范围回填 code 再验证，避免长时间循环。
+                            if self._code_mismatch_retries >= 6 and len(path_invalids) == len(invalids):
                                 aligned_findings, aligned_count = _force_align_node_code_to_ranges(
                                     step.final_answer.get("findings", []),
                                     project_root,
@@ -1147,9 +1251,13 @@ class VerificationAgent(BaseAgent):
                                         )
                                     else:
                                         invalids = second_invalids
-                                        mismatch_invalids = [
+                                        path_invalids = [
                                             x for x in invalids
-                                            if ("code not found in file range" in x or "code unrelated to file range" in x)
+                                            if (
+                                                "code not found in file range" in x
+                                                or "code unrelated to file range" in x
+                                                or "file/range unreadable" in x
+                                            )
                                         ]
                             if not invalids:
                                 self._code_mismatch_retries = 0
@@ -1171,7 +1279,7 @@ class VerificationAgent(BaseAgent):
                                 rejected_text = rejected_text[:12000] + "\n... (truncated)"
                             await self.emit_thinking(f"🧾 被拒收的 Final Answer:\n{rejected_text}")
                             mismatch_detail_text = ""
-                            if self._code_mismatch_retries > 2 and mismatch_invalids:
+                            if self._code_mismatch_retries > 2 and path_invalids:
                                 details = _collect_code_mismatch_details(step.final_answer.get("findings", []), project_root)
                                 if details:
                                     mismatch_detail_text = (

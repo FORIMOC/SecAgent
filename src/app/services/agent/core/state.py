@@ -84,7 +84,7 @@ class AgentState(BaseModel):
     waiting_for_input: bool = False
     waiting_start_time: Optional[datetime] = None
     waiting_reason: str = ""
-    waiting_timeout_seconds: int = 600  # 10分钟超时
+    waiting_timeout_seconds: int = 1800  # 30分钟超时
     
     # ============ 最终结果 ============
     final_result: Optional[Dict[str, Any]] = None

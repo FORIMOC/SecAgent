@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/data/repos/2moons_26f9dea73b5bc087" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/data/repos/ADOdb_75e2fce97d1d43b4" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/data/repos/ARRP_2c385a06cd2b8663" vcs="Git" />
@@ -451,5 +452,55 @@
     <mapping directory="$PROJECT_DIR$/data/repos/zinc_eb3ed3d1b029ac0e" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/data/repos/zitadel_be2f64b975ab42a6" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/data/repos/zulip_250c18f1ecc4e9aa" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2013-10026/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2014-0593/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2014-125032/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2014-125075/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-0415/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-0870/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-0940/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-1291/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-1575/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-1883/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-2016/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-2028/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-2300/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-23059/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-23071/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-23074/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-23466/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-23612/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-24753/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-24830/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-24861/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-24897/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-31020/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-31038/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-31133/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-35947/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-3708/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-3751/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-41931/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-4495/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-4593/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-4595/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-4691/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2022-4695/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-24893/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-25197/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-25295/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-25300/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-31135/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-46335/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-54384/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-55156/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-61603/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-6166/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-61774/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-61784/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-62424/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-64115/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-64176/repo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/verify/repos/CVE-2025-8555/repo" vcs="Git" />
   </component>
 </project>

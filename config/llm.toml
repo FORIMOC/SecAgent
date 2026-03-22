@@ -25,5 +25,5 @@ gemini = "GEMINI_API_KEY"
 llm_first_token_timeout = 30
 llm_stream_timeout = 60
 agent_timeout_seconds = 1800
-sub_agent_timeout_seconds = 600
+sub_agent_timeout_seconds = 1800
 tool_timeout_seconds = 60

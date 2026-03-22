@@ -16,6 +16,7 @@ class CVEConstraint:
     patch_old_lines: list[str] = field(default_factory=list)
     patch_new_lines: list[str] = field(default_factory=list)
     patch_focus_variables: list[str] = field(default_factory=list)
+    patch_focus_semantic_snippets: list[dict[str, str]] = field(default_factory=list)
     advisory_summary: str = ""
     advisory_refs: list[str] = field(default_factory=list)
     vulnerability_hint: str = "generic"
